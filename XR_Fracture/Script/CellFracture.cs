@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Reflection;
 using UnityEngine;
 using SimpleFracture;
 
@@ -45,6 +46,12 @@ public class CellFracture : MonoBehaviour
     public bool 只破坏一次 = true;
 
     [Header("碎片设置")]
+    [Tooltip("需要传递给子碎片物体的组件实例（拖入场景中已挂载的组件，会复制其序列化字段值）。")]
+    public Component[] 子物组件 = new Component[0];
+
+    [Tooltip("需要传递给子碎片物体的组件类型名称（填写 C# 类名，如 \"MyScript\"，支持任意项目中或引擎内置的组件）。")]
+    public string[] 子物脚本类型 = new string[0];
+
     [Tooltip("为真时，破碎后移除原始物体。")]
     public bool 是否销毁原体 = true;
 
@@ -350,6 +357,11 @@ public class CellFracture : MonoBehaviour
         childFracture.递归概率 = this.递归概率;
         childFracture.递归目标 = this.递归目标;
         childFracture.已生成 = true;
+        childFracture.子物组件 = this.子物组件;
+        childFracture.子物脚本类型 = this.子物脚本类型;
+
+        // 将用户指定的组件传递给子碎片（在所有标准组件之后，确保依赖满足）
+        CopyComponentsToChild(go);
 
         // 对子碎片按概率递归破碎
         if (this.递归次数 > 0 && this.递归概率 > 0f)
@@ -368,6 +380,137 @@ public class CellFracture : MonoBehaviour
         if (child != null && child.gameObject != null)
         {
             child.Fracture();
+        }
+    }
+
+    /// <summary>
+    /// 将检视器中挂载的组件复制到子碎片物体上。
+    /// 优先处理组件实例（复制序列化字段值），再处理类型名称（创建默认实例）。
+    /// </summary>
+    private void CopyComponentsToChild(GameObject target)
+    {
+        var addedTypes = new HashSet<Type>();
+
+        // 第一遍：处理组件实例（拖入的场景组件，可复制配置值）
+        if (子物组件 != null)
+        {
+            foreach (var source in 子物组件)
+            {
+                if (source == null)
+                    continue;
+
+                var type = source.GetType();
+
+                if (type == typeof(Transform) || type == typeof(CellFracture))
+                    continue;
+
+                if (target.GetComponent(type) != null)
+                    continue;
+
+                Component copy = target.AddComponent(type);
+                CopySerializedFields(source, copy, type);
+                addedTypes.Add(type);
+            }
+        }
+
+        // 第二遍：处理类型名称字符串（任意 C# 组件，使用默认值）
+        if (子物脚本类型 != null)
+        {
+            foreach (var typeName in 子物脚本类型)
+            {
+                if (string.IsNullOrWhiteSpace(typeName))
+                    continue;
+
+                Type type = ResolveComponentType(typeName.Trim());
+                if (type == null)
+                {
+                    Debug.LogWarning($"[CellFracture] 无法解析组件类型: \"{typeName}\"，请确认类名正确。", this);
+                    continue;
+                }
+
+                if (type == typeof(Transform) || type == typeof(CellFracture))
+                    continue;
+
+                if (addedTypes.Contains(type) || target.GetComponent(type) != null)
+                    continue;
+
+                target.AddComponent(type);
+                addedTypes.Add(type);
+            }
+        }
+    }
+
+    /// <summary>
+    /// 根据类型名称解析 System.Type，支持简单类名和完整限定名，
+    /// 会搜索所有已加载的程序集。
+    /// </summary>
+    private static Type ResolveComponentType(string typeName)
+    {
+        // 先尝试直接解析（适用于完整限定名或 mscorlib 中的类型）
+        Type type = Type.GetType(typeName);
+        if (type != null && typeof(Component).IsAssignableFrom(type))
+            return type;
+
+        // 跨所有已加载程序集搜索
+        var assemblies = AppDomain.CurrentDomain.GetAssemblies();
+        foreach (var asm in assemblies)
+        {
+            // 先按完整名称匹配
+            type = asm.GetType(typeName);
+            if (type != null && typeof(Component).IsAssignableFrom(type))
+                return type;
+
+            // 按简单名称模糊匹配（忽略命名空间）
+            try
+            {
+                foreach (var t in asm.GetTypes())
+                {
+                    if (t.Name == typeName && typeof(Component).IsAssignableFrom(t))
+                        return t;
+                }
+            }
+            catch
+            {
+                // 某些程序集 GetTypes() 会抛出异常，跳过
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// 通过反射将源组件的可序列化字段值复制到目标组件。
+    /// </summary>
+    private static void CopySerializedFields(Component source, Component target, Type type)
+    {
+        const BindingFlags flags = BindingFlags.Public
+                                  | BindingFlags.NonPublic
+                                  | BindingFlags.Instance
+                                  | BindingFlags.FlattenHierarchy;
+
+        var fields = type.GetFields(flags);
+        foreach (var field in fields)
+        {
+            // 仅复制 [SerializeField] 或 public 且非 [NonSerialized] 的字段
+            bool isSerialized = field.IsDefined(typeof(SerializeField), false)
+                || (field.IsPublic && !field.IsDefined(typeof(NonSerializedAttribute), false));
+
+            if (!isSerialized)
+                continue;
+
+            // 跳过 init-only 字段（C# 9+ 的 init 访问器）
+            if (field.IsInitOnly)
+                continue;
+
+            try
+            {
+                object value = field.GetValue(source);
+                field.SetValue(target, value);
+            }
+            catch
+            {
+                // 某些字段（如 native 指针）无法通过反射复制，静默跳过
+            }
         }
     }
 
