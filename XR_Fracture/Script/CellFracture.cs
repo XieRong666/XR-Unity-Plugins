@@ -87,15 +87,6 @@ public class CellFracture : MonoBehaviour
     [Range(0f, 1f)]
     public float 递归概率 = 0.25f;
 
-    [Tooltip("递归目标选择：随机 / 小碎片优先 / 大碎片优先。")]
-    public RecursionTarget 递归目标 = RecursionTarget.小碎片优先;
-
-    public enum RecursionTarget
-    {
-        随机,
-        小碎片优先,
-        大碎片优先
-    }
 
     // 标记此组件是否为运行时生成的碎片
     [NonSerialized]
@@ -355,7 +346,6 @@ public class CellFracture : MonoBehaviour
         childFracture.递归次数 = Mathf.Max(0, this.递归次数 - 1);
         childFracture.递归源点限制 = this.递归源点限制;
         childFracture.递归概率 = this.递归概率;
-        childFracture.递归目标 = this.递归目标;
         childFracture.已生成 = true;
         childFracture.子物组件 = this.子物组件;
         childFracture.子物脚本类型 = this.子物脚本类型;
