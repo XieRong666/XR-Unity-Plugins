@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Rendering;
@@ -54,10 +54,6 @@ namespace SimpleFracture
                 z = Mathf.RoundToInt(p.z / EPS);
             }
 
-            /// <summary>
-            /// 构造一个 PointKey，直接使用已量化的网格坐标。
-            /// 用于在 BuildLoopsFromSegments 中检查相邻网格单元。
-            /// </summary>
             public PointKey(int quantizedX, int quantizedY, int quantizedZ)
             {
                 x = quantizedX;
@@ -215,7 +211,12 @@ namespace SimpleFracture
             }
         }
 
-        public static SliceResult Slice(Mesh sourceMesh, Vector3 planePointLocal, Vector3 planeNormalLocal)
+        public static SliceResult Slice(
+            Mesh sourceMesh,
+            Vector3 planePointLocal,
+            Vector3 planeNormalLocal,
+            bool sealPositiveBoundary = true,
+            bool sealNegativeBoundary = true)
         {
             if (sourceMesh == null)
                 throw new ArgumentNullException(nameof(sourceMesh));
@@ -282,7 +283,14 @@ namespace SimpleFracture
                 }
             }
 
-            List<List<Vector3>> loops = BuildLoopsFromSegments(capSegments);
+            List<List<Vector3>> loops = BuildLoopsFromSegments(capSegments, planeNormalLocal);
+            if (loops.Count == 0)
+            {
+                List<Vector3> fallbackLoop = BuildFallbackLoopFromSegments(capSegments, planeNormalLocal);
+                if (fallbackLoop.Count >= 3)
+                    loops.Add(fallbackLoop);
+            }
+
             for (int i = 0; i < loops.Count; i++)
             {
                 List<Vector3> loop = loops[i];
@@ -299,6 +307,11 @@ namespace SimpleFracture
                 negative = negativeBuilder.vertices.Count > 0 ? negativeBuilder.ToMesh(sourceMesh.name + "_Negative") : null
             };
 
+            if (sealPositiveBoundary)
+                SealOpenBoundaries(result.positive);
+            if (sealNegativeBoundary)
+                SealOpenBoundaries(result.negative);
+
             return result;
         }
 
@@ -314,6 +327,251 @@ namespace SimpleFracture
             Vector3 n = hasNormals ? normals[index] : Vector3.up;
             Vector2 uv = hasUVs ? uvs[index] : Vector2.zero;
             return new VertexData(p, n, uv);
+        }
+
+        private static void SealOpenBoundaries(Mesh mesh)
+        {
+            if (mesh == null || mesh.vertexCount < 3)
+                return;
+
+            Vector3[] vertices = mesh.vertices;
+            int[] triangles = mesh.triangles;
+            if (triangles == null || triangles.Length < 3)
+                return;
+
+            var pointToId = new Dictionary<PointKey, int>();
+            var idToPoint = new List<Vector3>();
+            var vertexToPoint = new int[vertices.Length];
+
+            for (int i = 0; i < vertices.Length; i++)
+            {
+                var key = new PointKey(vertices[i]);
+                if (!pointToId.TryGetValue(key, out int id))
+                {
+                    id = idToPoint.Count;
+                    pointToId[key] = id;
+                    idToPoint.Add(vertices[i]);
+                }
+
+                vertexToPoint[i] = id;
+            }
+
+            var edgeUseCount = new Dictionary<EdgeKey, int>();
+
+            void AddEdge(int a, int b)
+            {
+                if (a == b)
+                    return;
+
+                var key = new EdgeKey(a, b);
+                edgeUseCount.TryGetValue(key, out int count);
+                edgeUseCount[key] = count + 1;
+            }
+
+            for (int i = 0; i < triangles.Length; i += 3)
+            {
+                int a = vertexToPoint[triangles[i]];
+                int b = vertexToPoint[triangles[i + 1]];
+                int c = vertexToPoint[triangles[i + 2]];
+
+                AddEdge(a, b);
+                AddEdge(b, c);
+                AddEdge(c, a);
+            }
+
+            var adjacency = new Dictionary<int, List<int>>();
+
+            void AddNeighbor(int a, int b)
+            {
+                if (!adjacency.TryGetValue(a, out var list))
+                {
+                    list = new List<int>();
+                    adjacency[a] = list;
+                }
+
+                if (!list.Contains(b))
+                    list.Add(b);
+            }
+
+            foreach (var kvp in edgeUseCount)
+            {
+                if (kvp.Value != 1)
+                    continue;
+
+                int a = kvp.Key.GetA();
+                int b = kvp.Key.GetB();
+                AddNeighbor(a, b);
+                AddNeighbor(b, a);
+            }
+
+            if (adjacency.Count == 0)
+                return;
+
+            var usedEdges = new HashSet<EdgeKey>();
+            var addedVertices = new List<Vector3>(vertices);
+            var addedTriangles = new List<int>(triangles);
+
+            foreach (var kvp in adjacency)
+            {
+                int start = kvp.Key;
+                foreach (int first in kvp.Value)
+                {
+                    var startEdge = new EdgeKey(start, first);
+                    if (usedEdges.Contains(startEdge))
+                        continue;
+
+                    var loop = new List<int> { start };
+                    int previous = start;
+                    int current = first;
+                    usedEdges.Add(startEdge);
+
+                    int safety = 0;
+                    bool closed = false;
+
+                    while (safety++ < adjacency.Count + 4)
+                    {
+                        loop.Add(current);
+
+                        if (!adjacency.TryGetValue(current, out var neighbors))
+                            break;
+
+                        int next = -1;
+                        for (int i = 0; i < neighbors.Count; i++)
+                        {
+                            int candidate = neighbors[i];
+                            var candidateEdge = new EdgeKey(current, candidate);
+                            if (candidate == previous || usedEdges.Contains(candidateEdge))
+                                continue;
+
+                            next = candidate;
+                            break;
+                        }
+
+                        if (next < 0)
+                        {
+                            for (int i = 0; i < neighbors.Count; i++)
+                            {
+                                if (neighbors[i] == start)
+                                {
+                                    next = start;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (next < 0)
+                            break;
+
+                        usedEdges.Add(new EdgeKey(current, next));
+                        previous = current;
+                        current = next;
+
+                        if (current == start)
+                        {
+                            closed = true;
+                            break;
+                        }
+                    }
+
+                    if (!closed || loop.Count < 3)
+                        continue;
+
+                    AppendBoundaryCap(loop, idToPoint, addedVertices, addedTriangles);
+                }
+            }
+
+            if (addedTriangles.Count == triangles.Length)
+                return;
+
+            mesh.Clear();
+            if (addedVertices.Count > 65535)
+                mesh.indexFormat = IndexFormat.UInt32;
+            mesh.SetVertices(addedVertices);
+            mesh.SetTriangles(addedTriangles, 0);
+            mesh.RecalculateNormals();
+            mesh.RecalculateBounds();
+        }
+
+        private static void AppendBoundaryCap(
+            List<int> loop,
+            List<Vector3> points,
+            List<Vector3> vertices,
+            List<int> triangles)
+        {
+            Vector3 normal = CalculateLoopNormal(loop, points);
+            if (normal.sqrMagnitude <= EPS * EPS)
+                return;
+
+            normal.Normalize();
+            Vector3 meshCenter = Vector3.zero;
+            for (int i = 0; i < vertices.Count; i++)
+                meshCenter += vertices[i];
+            meshCenter /= Mathf.Max(1, vertices.Count);
+
+            Vector3 loopCenter = Vector3.zero;
+            for (int i = 0; i < loop.Count; i++)
+                loopCenter += points[loop[i]];
+            loopCenter /= loop.Count;
+
+            if (Vector3.Dot(normal, loopCenter - meshCenter) < 0f)
+                normal = -normal;
+
+            BuildPlaneBasis(normal, out Vector3 tangent, out Vector3 bitangent);
+
+            var projected = ProjectLoop(loop, points, tangent, bitangent);
+            if (SignedArea(projected) < 0f)
+            {
+                loop = new List<int>(loop);
+                loop.Reverse();
+                projected.Reverse();
+            }
+
+            var capIndices = TriangulatePolygon(projected);
+            if (capIndices.Count < 3)
+            {
+                for (int i = 1; i < loop.Count - 1; i++)
+                {
+                    int ia = AddCapVertex(points[loop[0]], vertices);
+                    int ib = AddCapVertex(points[loop[i]], vertices);
+                    int ic = AddCapVertex(points[loop[i + 1]], vertices);
+                    triangles.Add(ia);
+                    triangles.Add(ib);
+                    triangles.Add(ic);
+                }
+                return;
+            }
+
+            for (int i = 0; i < capIndices.Count; i += 3)
+            {
+                int ia = AddCapVertex(points[loop[capIndices[i]]], vertices);
+                int ib = AddCapVertex(points[loop[capIndices[i + 1]]], vertices);
+                int ic = AddCapVertex(points[loop[capIndices[i + 2]]], vertices);
+                triangles.Add(ia);
+                triangles.Add(ib);
+                triangles.Add(ic);
+            }
+        }
+
+        private static int AddCapVertex(Vector3 point, List<Vector3> vertices)
+        {
+            int index = vertices.Count;
+            vertices.Add(point);
+            return index;
+        }
+
+        private static Vector3 CalculateLoopNormal(List<int> loop, List<Vector3> points)
+        {
+            Vector3 normal = Vector3.zero;
+            for (int i = 0; i < loop.Count; i++)
+            {
+                Vector3 current = points[loop[i]];
+                Vector3 next = points[loop[(i + 1) % loop.Count]];
+                normal.x += (current.y - next.y) * (current.z + next.z);
+                normal.y += (current.z - next.z) * (current.x + next.x);
+                normal.z += (current.x - next.x) * (current.y + next.y);
+            }
+
+            return normal;
         }
 
         private static float SignedDistance(Vector3 point, Vector3 planeNormal, float planeD)
@@ -454,11 +712,13 @@ namespace SimpleFracture
             points.Add(p);
         }
 
-        private static List<List<Vector3>> BuildLoopsFromSegments(List<Segment> segments)
+        private static List<List<Vector3>> BuildLoopsFromSegments(List<Segment> segments, Vector3 planeNormal)
         {
             var loops = new List<List<Vector3>>();
             if (segments == null || segments.Count == 0)
                 return loops;
+
+            BuildPlaneBasis(planeNormal, out Vector3 tangent, out Vector3 bitangent);
 
             var pointToId = new Dictionary<PointKey, int>();
             var idToPoint = new List<Vector3>();
@@ -470,9 +730,6 @@ namespace SimpleFracture
                 if (pointToId.TryGetValue(key, out int id))
                     return id;
 
-                // 修正量化边界问题：检查相邻网格单元中是否存在距离在 EPS 内的点。
-                // 当两个几乎相同的点位于量化网格边界两侧时，直接 PointKey 查询会失败，
-                // 导致本应连接的线段在邻接图中断开，最终产生不封闭的网格。
                 int qx = Mathf.RoundToInt(p.x / EPS);
                 int qy = Mathf.RoundToInt(p.y / EPS);
                 int qz = Mathf.RoundToInt(p.z / EPS);
@@ -484,15 +741,11 @@ namespace SimpleFracture
                     {
                         for (int dz = -1; dz <= 1; dz++)
                         {
-                            if (dx == 0 && dy == 0 && dz == 0)
-                                continue;
-
                             var neighborKey = new PointKey(qx + dx, qy + dy, qz + dz);
-                            if (pointToId.TryGetValue(neighborKey, out int neighborId))
+                            if (pointToId.TryGetValue(neighborKey, out int neighborId)
+                                && (idToPoint[neighborId] - p).sqrMagnitude <= epsSq)
                             {
-                                // 验证实际距离是否在容差内
-                                if ((idToPoint[neighborId] - p).sqrMagnitude <= epsSq)
-                                    return neighborId;
+                                return neighborId;
                             }
                         }
                     }
@@ -501,145 +754,170 @@ namespace SimpleFracture
                 id = idToPoint.Count;
                 pointToId[key] = id;
                 idToPoint.Add(p);
-                adjacency[id] = new List<int>();
                 return id;
             }
 
-            void Connect(int a, int b)
+            void AddNeighbor(int a, int b)
             {
-                if (a == b) return;
-                if (!adjacency[a].Contains(b))
-                    adjacency[a].Add(b);
-                if (!adjacency[b].Contains(a))
-                    adjacency[b].Add(a);
+                if (!adjacency.TryGetValue(a, out var neighbors))
+                {
+                    neighbors = new List<int>();
+                    adjacency[a] = neighbors;
+                }
+
+                if (!neighbors.Contains(b))
+                    neighbors.Add(b);
             }
 
-            foreach (var s in segments)
+            foreach (var segment in segments)
             {
-                int a = GetPointId(s.a);
-                int b = GetPointId(s.b);
-                Connect(a, b);
+                int a = GetPointId(segment.a);
+                int b = GetPointId(segment.b);
+                if (a == b)
+                    continue;
+
+                AddNeighbor(a, b);
+                AddNeighbor(b, a);
             }
 
-            long EdgeKey(int a, int b)
+            float AngleFromTo(int from, int to)
             {
-                return ((long)Mathf.Min(a, b) << 32) | (uint)Mathf.Max(a, b);
+                Vector3 direction = idToPoint[to] - idToPoint[from];
+                Vector2 projected = new Vector2(
+                    Vector3.Dot(direction, tangent),
+                    Vector3.Dot(direction, bitangent));
+                return Mathf.Atan2(projected.y, projected.x);
             }
 
-            var usedEdges = new HashSet<long>();
+            foreach (var kvp in adjacency)
+            {
+                int center = kvp.Key;
+                kvp.Value.Sort((a, b) => AngleFromTo(center, a).CompareTo(AngleFromTo(center, b)));
+            }
+
+            int FindNextPoint(int previous, int current)
+            {
+                if (!adjacency.TryGetValue(current, out var neighbors) || neighbors.Count == 0)
+                    return -1;
+
+                int incomingIndex = neighbors.IndexOf(previous);
+                if (incomingIndex < 0)
+                    return -1;
+
+                return neighbors[(incomingIndex - 1 + neighbors.Count) % neighbors.Count];
+            }
+
+            var usedHalfEdges = new HashSet<(int from, int to)>();
+            int safetyLimit = segments.Count * 4 + 8;
 
             foreach (var kvp in adjacency)
             {
                 int start = kvp.Key;
-                if (adjacency[start].Count == 0)
-                    continue;
+                var neighbors = kvp.Value;
 
-                foreach (int firstNeighbor in adjacency[start])
+                for (int i = 0; i < neighbors.Count; i++)
                 {
-                    long firstEdge = EdgeKey(start, firstNeighbor);
-                    if (usedEdges.Contains(firstEdge))
+                    int first = neighbors[i];
+                    var startHalfEdge = (from: start, to: first);
+                    if (usedHalfEdges.Contains(startHalfEdge))
                         continue;
 
                     var loopIndices = new List<int>();
-                    int current = start;
-                    int previous = -1;
+                    int previous = start;
+                    int current = first;
+
                     int safety = 0;
+                    bool closed = false;
 
-                    while (safety++ < 10000)
+                    while (safety++ < safetyLimit)
                     {
-                        loopIndices.Add(current);
+                        usedHalfEdges.Add((previous, current));
+                        loopIndices.Add(previous);
 
-                        int next = -1;
-                        var neighbors = adjacency[current];
-
-                        // 当顶点度数为 2 时直接选择非前驱的邻居；
-                        // 当度数 != 2 时（多条交线汇聚于同一点），
-                        // 选择使环保持最直方向的边，避免追踪出错误的环。
-                        if (neighbors.Count == 2)
-                        {
-                            foreach (int neighbor in neighbors)
-                            {
-                                if (neighbor == previous)
-                                    continue;
-                                long edge = EdgeKey(current, neighbor);
-                                if (usedEdges.Contains(edge))
-                                    continue;
-                                next = neighbor;
-                                break;
-                            }
-                        }
-                        else
-                        {
-                            // 度数 != 2：选择最直的方向
-                            float bestAngle = float.MaxValue;
-                            Vector3 prevDir = previous >= 0
-                                ? (idToPoint[current] - idToPoint[previous]).normalized
-                                : Vector3.zero;
-
-                            foreach (int neighbor in neighbors)
-                            {
-                                if (neighbor == previous)
-                                    continue;
-                                long edge = EdgeKey(current, neighbor);
-                                if (usedEdges.Contains(edge))
-                                    continue;
-
-                                if (previous < 0)
-                                {
-                                    // 起始顶点：选择第一个可用邻居（与 firstNeighbor 一致）
-                                    next = neighbor;
-                                    break;
-                                }
-
-                                Vector3 candDir = (idToPoint[neighbor] - idToPoint[current]).normalized;
-                                float dot = -Vector3.Dot(prevDir, candDir);
-                                float angle = Mathf.Abs(dot + 1f);
-                                if (angle < bestAngle)
-                                {
-                                    bestAngle = angle;
-                                    next = neighbor;
-                                }
-                            }
-                        }
-
-                        if (next == -1)
+                        int next = FindNextPoint(previous, current);
+                        if (next < 0)
                             break;
 
-                        usedEdges.Add(EdgeKey(current, next));
                         previous = current;
                         current = next;
 
-                        if (current == start)
+                        if (previous == start && current == first)
                         {
-                            loopIndices.Add(current);
+                            closed = true;
                             break;
                         }
                     }
 
-                    if (loopIndices.Count >= 4 && loopIndices[0] == loopIndices[loopIndices.Count - 1])
-                    {
-                        loopIndices.RemoveAt(loopIndices.Count - 1);
-                        loops.Add(loopIndices.ConvertAll(i => idToPoint[i]));
-                    }
+                    if (!closed || loopIndices.Count < 3)
+                        continue;
+
+                    var projectedLoop = ProjectLoop(loopIndices, idToPoint, tangent, bitangent);
+                    if (SignedArea(projectedLoop) <= EPS)
+                        continue;
+
+                    var loop = new List<Vector3>(loopIndices.Count);
+                    for (int p = 0; p < loopIndices.Count; p++)
+                        loop.Add(idToPoint[loopIndices[p]]);
+
+                    loops.Add(loop);
                 }
             }
 
             return loops;
         }
 
-        private static List<Vector3> DeduplicatePoints(List<Vector3> points)
+        private static List<Vector2> ProjectLoop(
+            List<int> loopIndices,
+            List<Vector3> points,
+            Vector3 tangent,
+            Vector3 bitangent)
         {
-            var result = new List<Vector3>();
-            var seen = new HashSet<PointKey>();
+            var projected = new List<Vector2>(loopIndices.Count);
+            for (int i = 0; i < loopIndices.Count; i++)
+                projected.Add(Project(points[loopIndices[i]], tangent, bitangent));
 
-            for (int i = 0; i < points.Count; i++)
+            return projected;
+        }
+
+        private static List<Vector3> BuildFallbackLoopFromSegments(List<Segment> segments, Vector3 planeNormal)
+        {
+            var points = new List<Vector3>();
+            if (segments == null || segments.Count == 0)
+                return points;
+
+            foreach (var segment in segments)
             {
-                var key = new PointKey(points[i]);
-                if (seen.Add(key))
-                    result.Add(points[i]);
+                AddUnique(points, segment.a);
+                AddUnique(points, segment.b);
             }
 
-            return result;
+            if (points.Count < 3)
+                return points;
+
+            BuildPlaneBasis(planeNormal, out Vector3 tangent, out Vector3 bitangent);
+
+            Vector3 center = Vector3.zero;
+            for (int i = 0; i < points.Count; i++)
+                center += points[i];
+            center /= points.Count;
+
+            points.Sort((a, b) =>
+            {
+                Vector3 da = a - center;
+                Vector3 db = b - center;
+                float angleA = Mathf.Atan2(Vector3.Dot(da, bitangent), Vector3.Dot(da, tangent));
+                float angleB = Mathf.Atan2(Vector3.Dot(db, bitangent), Vector3.Dot(db, tangent));
+                return angleA.CompareTo(angleB);
+            });
+
+            var projected = new List<Vector2>(points.Count);
+            for (int i = 0; i < points.Count; i++)
+                projected.Add(Project(points[i], tangent, bitangent));
+
+            if (SignedArea(projected) < 0f)
+                points.Reverse();
+
+            return points;
         }
 
         private static void AddCap(
@@ -651,17 +929,11 @@ namespace SimpleFracture
             if (loop == null || loop.Count < 3)
                 return;
 
-            // 第一步：完整去重（保留首次出现顺序），移除可能因浮点误差或
-            // 非流形交线追踪产生的非连续重复点。
-            List<Vector3> uniquePoints = DeduplicatePoints(loop);
-            if (uniquePoints.Count < 3)
-                return;
+            var cleanPoints = new List<Vector3>(loop.Count);
 
-            // 第二步：去除连续重复点（闭合环的首尾重复）
-            var cleanPoints = new List<Vector3>(uniquePoints.Count);
-            for (int i = 0; i < uniquePoints.Count; i++)
+            for (int i = 0; i < loop.Count; i++)
             {
-                Vector3 p = uniquePoints[i];
+                Vector3 p = loop[i];
                 if (cleanPoints.Count > 0
                     && (cleanPoints[cleanPoints.Count - 1] - p).sqrMagnitude <= EPS * EPS)
                     continue;
@@ -678,12 +950,10 @@ namespace SimpleFracture
 
             BuildPlaneBasis(capNormal, out Vector3 tangent, out Vector3 bitangent);
 
-            // 投影到 2D 平面
             List<Vector2> projected = new List<Vector2>(cleanPoints.Count);
             for (int i = 0; i < cleanPoints.Count; i++)
                 projected.Add(Project(cleanPoints[i], tangent, bitangent));
 
-            // 检查 2D 多边形方向，确保为逆时针(CCW)
             if (SignedArea(projected) < 0f)
             {
                 cleanPoints.Reverse();
@@ -695,11 +965,9 @@ namespace SimpleFracture
                 return Vector3.Dot(Vector3.Cross(b - a, c - a), normal) > 0f;
             }
 
-            // Ear clipping 三角化
             var indices = TriangulatePolygon(projected);
             if (indices.Count < 3)
             {
-                // 回退到扇形三角化
                 for (int i = 1; i < cleanPoints.Count - 1; i++)
                 {
                     int ia = 0;

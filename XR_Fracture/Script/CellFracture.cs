@@ -1,89 +1,77 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Reflection;
 using UnityEngine;
 using SimpleFracture;
 
 /// <summary>
-/// Cell Fracture — 基于 Voronoi 图（泰森多边形）的网格破碎组件。
-///
-/// 算法原理（仿照 Blender Cell Fracture 插件）：
-/// 1. 在网格包围盒内生成 N 个随机细胞点（种子点）
-/// 2. 对每个细胞点，计算它与其他所有点之间的平分平面（bisecting plane）
-/// 3. 用这些平分平面依次切割源网格，每次保留细胞点所在的一侧
-/// 4. 切割完毕后得到的网格即该 Voronoi 细胞与源网格的交集
-///
-/// Cell Fracture 将整个物体划分为 Voronoi 细胞碎片，适合整体破碎效果。
+/// 基于 Voronoi 细胞的运行时网格破碎组件。
 /// </summary>
 [RequireComponent(typeof(MeshFilter), typeof(MeshRenderer), typeof(Collider))]
 public class CellFracture : MonoBehaviour
 {
     [Header("细胞设置")]
-    [Tooltip("生成的碎片（细胞）数量。")]
+    [Tooltip("生成的碎片数量。数值越高碎片越多，但运行时切割和物理开销也越高。")]
     [Range(2, 50)]
     public int 细胞数量 = 8;
 
-    [Tooltip("限制使用的种子点数量（0 = 不限制）。")]
-    [Range(0, 5000)]
-    public int 源点限制 = 100;
-
-    [Tooltip("种子点位置的随机扰动程度（0-1）。")]
+    [Tooltip("给细胞种子点添加随机偏移。0 表示均匀随机点，值越高碎片形状越不规则。")]
     [Range(0f, 1f)]
     public float 源点噪声 = 0f;
 
-    [Tooltip("细胞形状的非均匀缩放（X/Y/Z），产生拉长的碎片。")]
+    [Tooltip("控制细胞切割方向的非均匀缩放。可用来生成被拉长或压扁的碎片形状。")]
     public Vector3 细胞缩放 = Vector3.one;
 
-    [Tooltip("碎片之间的间隙，用于提高物理稳定性。")]
+    [Tooltip("碎片之间预留的微小间隙。适当增大可减少物理重叠，但过大可能让裂缝明显。")]
     [Range(0f, 0.01f)]
     public float 间隙 = 0.001f;
 
+    [Tooltip("每个细胞最多使用的最近切割平面数。0 表示使用全部平面；较小值破碎更快但形状近似度更低。")]
+    [Range(0, 64)]
+    public int 最大切割平面数 = 12;
+
     [Header("破碎触发")]
-    [Tooltip("触发破碎所需的最小冲击力。")]
+    [Tooltip("碰撞相对速度平方达到该阈值平方时触发破碎。值越高越不容易破碎。")]
     public float 影响阈值 = 2f;
 
-    [Tooltip("为真时，仅第一次有效碰撞会触发破碎。")]
+    [Tooltip("启用后，同一个物体只会响应第一次有效破碎触发。")]
     public bool 只破坏一次 = true;
 
     [Header("碎片设置")]
-    [Tooltip("需要传递给子碎片物体的组件实例（拖入场景中已挂载的组件，会复制其序列化字段值）。")]
+    [Tooltip("破碎后复制到每个子碎片上的组件实例。会复制这些组件的可序列化字段值。")]
     public Component[] 子物组件 = new Component[0];
 
-    [Tooltip("需要传递给子碎片物体的组件类型名称（填写 C# 类名，如 \"MyScript\"，支持任意项目中或引擎内置的组件）。")]
+    [Tooltip("破碎后添加到每个子碎片上的组件类型名。填写 C# 类名或完整类型名。")]
     public string[] 子物脚本类型 = new string[0];
 
-    [Tooltip("为真时，破碎后移除原始物体。")]
+    [Tooltip("破碎完成后是否销毁原始物体。关闭后原物体会保留在场景中。")]
     public bool 是否销毁原体 = true;
 
-    [Tooltip("碎片生成后的统一缩放系数（1 = 原始大小）。")]
+    [Tooltip("所有碎片生成后的统一缩放系数。小于 1 可拉开裂缝，大于 1 会放大碎片。")]
     [Range(0.1f, 5f)]
     public float 碎片缩放 = 1f;
 
-    [Tooltip("启用破碎碎片的网格碰撞器。")]
+    [Tooltip("是否为每个碎片添加凸 MeshCollider。关闭后碎片不会自动获得网格碰撞。")]
     public bool 添加网格碰撞器 = true;
 
-    [Tooltip("启用破碎碎片的刚体。")]
+    [Tooltip("是否为每个碎片添加 Rigidbody。关闭后碎片不会自动参与刚体物理。")]
     public bool 添加刚体 = true;
 
-    [Tooltip("启用静态破碎，使碎片保持原地而不飞出。")]
+    [Tooltip("启用后不添加 Rigidbody，使碎片保持静态位置，适合只展示破碎结果。")]
     public bool 静态破碎 = false;
 
-    [Tooltip("按体积分配质量。为真则按体积比例分配，为假则平均分配。")]
+    [Tooltip("启用后按碎片体积分配质量；关闭后每个碎片使用相同质量。")]
     public bool 按体积分配质量 = true;
 
-    [Tooltip("总质量（按体积分配时使用）。")]
+    [Tooltip("总质量。按体积分配质量时，会按体积比例分摊到所有碎片。")]
     public float 总质量 = 10f;
 
     [Header("递归破碎")]
-    [Tooltip("递归破碎次数（0 = 不递归，子碎片可继续破碎）。")]
+    [Tooltip("自动递归破碎的最大层数。0 表示不自动递归；值越高碎片数量增长越快。")]
     [Range(0, 5)]
     public int 递归次数 = 0;
 
-    [Tooltip("递归时的源点限制。")]
-    [Range(0, 5000)]
-    public int 递归源点限制 = 8;
-
-    [Tooltip("递归概率（0-1）。")]
+    [Tooltip("每个子碎片继续自动破碎的概率。仅在递归次数大于 0 时生效。")]
     [Range(0f, 1f)]
     public float 递归概率 = 0.25f;
 
@@ -120,8 +108,6 @@ public class CellFracture : MonoBehaviour
     }
 
     /// <summary>
-    /// 手动触发破碎（可从其他脚本调用或通过 UI 按钮调用）。
-    /// </summary>
     public void Fracture()
     {
         if (fractured && 只破坏一次)
@@ -142,7 +128,6 @@ public class CellFracture : MonoBehaviour
             return;
         }
 
-        // 生成细胞点
         Bounds bounds = mr.bounds;
         Vector3 boundsMin = transform.InverseTransformPoint(bounds.min);
         Vector3 boundsMax = transform.InverseTransformPoint(bounds.max);
@@ -155,11 +140,10 @@ public class CellFracture : MonoBehaviour
 
         if (cellPoints.Count < 2)
         {
-            Debug.LogWarning("[CellFracture] 生成的细胞点不足。");
+            Debug.LogWarning("[CellFracture] 生成的细胞点不足。", this);
             return;
         }
 
-        // 为每个细胞点切割出碎片
         List<Mesh> fragments = new List<Mesh>();
         List<Vector3> fragmentCenters = new List<Vector3>();
 
@@ -167,7 +151,6 @@ public class CellFracture : MonoBehaviour
         {
             Vector3 cellPoint = cellPoints[i];
 
-            // 计算该细胞相对于其他所有点的平分平面
             List<CutPlane> cellPlanes = GetCellPlanes(cellPoint, cellPoints);
 
             // 用所有平面依次切割网格，保留细胞点所在侧
@@ -182,13 +165,12 @@ public class CellFracture : MonoBehaviour
 
         if (fragments.Count < 2)
         {
-            Debug.LogWarning("[CellFracture] 未能生成足够的碎片。");
+            Debug.LogWarning("[CellFracture] 未能生成足够的碎片。", this);
             foreach (var m in fragments)
                 if (m != null) Destroy(m);
             return;
         }
 
-        // 创建碎片父物体
         GameObject rootObj = new GameObject(gameObject.name + "_CellFracture");
         Transform fragmentsRoot = rootObj.transform;
         fragmentsRoot.position = transform.position;
@@ -196,7 +178,6 @@ public class CellFracture : MonoBehaviour
         fragmentsRoot.localScale = transform.localScale;
         fragmentsRoot.SetParent(transform.parent, true);
 
-        // 添加 MeshScale 组件，用于滑动统一控制所有子碎片缩放
         MeshScale meshScale = rootObj.AddComponent<MeshScale>();
         meshScale.缩放 = 1f;
 
@@ -228,30 +209,23 @@ public class CellFracture : MonoBehaviour
             );
         }
 
-        // 销毁原物体
         if (是否销毁原体)
             Destroy(gameObject);
     }
 
     /// <summary>
-    /// 在网格的局部包围盒内生成细胞种子点（实例方法，转发到静态版本）。
-    /// </summary>
     private List<Vector3> GenerateCellPoints(Bounds localBounds)
     {
-        return GenerateCellPoints(localBounds, 细胞数量, 源点限制, 源点噪声, random);
+        return GenerateCellPoints(localBounds, 细胞数量, 源点噪声, random);
     }
 
     /// <summary>
-    /// 计算给定细胞点相对于其他所有点的平分平面列表（实例方法，转发到静态版本）。
-    /// </summary>
     private List<CutPlane> GetCellPlanes(Vector3 cellPoint, List<Vector3> allPoints)
     {
-        return GetCellPlanes(cellPoint, allPoints, 细胞缩放, 间隙);
+        return GetCellPlanes(cellPoint, allPoints, 细胞缩放, 间隙, 最大切割平面数);
     }
 
     /// <summary>
-    /// 创建碎片 GameObject。
-    /// </summary>
     private void CreateFracturePiece(
         Mesh mesh,
         Material[] materials,
@@ -263,11 +237,6 @@ public class CellFracture : MonoBehaviour
         GameObject go = new GameObject(gameObject.name + "_Cell_" + index);
 
         // 确保网格有正确的法线和包围盒
-        mesh.RecalculateNormals();
-        mesh.RecalculateBounds();
-
-        // 将 mesh 顶点偏移，使 pivot 对齐 mesh 的几何中心，
-        // 这样每个碎片的 localPosition 就不再是零，缩放时才能产生裂缝/扩散效果。
         Vector3 meshCenter = mesh.bounds.center;
         if (meshCenter != Vector3.zero)
         {
@@ -278,7 +247,6 @@ public class CellFracture : MonoBehaviour
             mesh.RecalculateBounds();
         }
 
-        // 把 GameObject 放在 mesh 几何中心对应的世界坐标上
         go.transform.position = transform.TransformPoint(meshCenter);
         go.transform.rotation = transform.rotation;
         go.transform.localScale = transform.localScale * 碎片缩放;
@@ -293,7 +261,6 @@ public class CellFracture : MonoBehaviour
         MeshRenderer mr = go.AddComponent<MeshRenderer>();
         mr.sharedMaterials = materials;
 
-        // 添加碰撞器
         if (添加网格碰撞器)
         {
             if (mesh != null && mesh.vertexCount >= 4 && mesh.triangles != null
@@ -327,13 +294,12 @@ public class CellFracture : MonoBehaviour
             rb.interpolation = RigidbodyInterpolation.Interpolate;
         }
 
-        // 添加子 CellFracture 组件用于递归破碎
         CellFracture childFracture = go.AddComponent<CellFracture>();
         childFracture.细胞数量 = this.细胞数量;
-        childFracture.源点限制 = this.递归源点限制;
         childFracture.源点噪声 = this.源点噪声;
         childFracture.细胞缩放 = this.细胞缩放;
         childFracture.间隙 = this.间隙;
+        childFracture.最大切割平面数 = this.最大切割平面数;
         childFracture.影响阈值 = this.影响阈值;
         childFracture.只破坏一次 = this.只破坏一次;
         childFracture.是否销毁原体 = this.是否销毁原体;
@@ -344,21 +310,17 @@ public class CellFracture : MonoBehaviour
         childFracture.总质量 = mass;
         childFracture.碎片缩放 = this.碎片缩放;
         childFracture.递归次数 = Mathf.Max(0, this.递归次数 - 1);
-        childFracture.递归源点限制 = this.递归源点限制;
         childFracture.递归概率 = this.递归概率;
         childFracture.已生成 = true;
         childFracture.子物组件 = this.子物组件;
         childFracture.子物脚本类型 = this.子物脚本类型;
 
-        // 将用户指定的组件传递给子碎片（在所有标准组件之后，确保依赖满足）
         CopyComponentsToChild(go);
 
-        // 对子碎片按概率递归破碎
         if (this.递归次数 > 0 && this.递归概率 > 0f)
         {
             if (random.NextDouble() < this.递归概率)
             {
-                // 延迟一帧触发递归破碎，避免在同一帧内产生过多碎片
                 childFracture.StartCoroutine(DeferredFracture(childFracture));
             }
         }
@@ -374,9 +336,6 @@ public class CellFracture : MonoBehaviour
     }
 
     /// <summary>
-    /// 将检视器中挂载的组件复制到子碎片物体上。
-    /// 优先处理组件实例（复制序列化字段值），再处理类型名称（创建默认实例）。
-    /// </summary>
     private void CopyComponentsToChild(GameObject target)
     {
         var addedTypes = new HashSet<Type>();
@@ -403,7 +362,6 @@ public class CellFracture : MonoBehaviour
             }
         }
 
-        // 第二遍：处理类型名称字符串（任意 C# 组件，使用默认值）
         if (子物脚本类型 != null)
         {
             foreach (var typeName in 子物脚本类型)
@@ -436,12 +394,10 @@ public class CellFracture : MonoBehaviour
     /// </summary>
     private static Type ResolveComponentType(string typeName)
     {
-        // 先尝试直接解析（适用于完整限定名或 mscorlib 中的类型）
         Type type = Type.GetType(typeName);
         if (type != null && typeof(Component).IsAssignableFrom(type))
             return type;
 
-        // 跨所有已加载程序集搜索
         var assemblies = AppDomain.CurrentDomain.GetAssemblies();
         foreach (var asm in assemblies)
         {
@@ -450,7 +406,6 @@ public class CellFracture : MonoBehaviour
             if (type != null && typeof(Component).IsAssignableFrom(type))
                 return type;
 
-            // 按简单名称模糊匹配（忽略命名空间）
             try
             {
                 foreach (var t in asm.GetTypes())
@@ -461,7 +416,6 @@ public class CellFracture : MonoBehaviour
             }
             catch
             {
-                // 某些程序集 GetTypes() 会抛出异常，跳过
             }
         }
 
@@ -469,8 +423,6 @@ public class CellFracture : MonoBehaviour
     }
 
     /// <summary>
-    /// 通过反射将源组件的可序列化字段值复制到目标组件。
-    /// </summary>
     private static void CopySerializedFields(Component source, Component target, Type type)
     {
         const BindingFlags flags = BindingFlags.Public
@@ -481,14 +433,12 @@ public class CellFracture : MonoBehaviour
         var fields = type.GetFields(flags);
         foreach (var field in fields)
         {
-            // 仅复制 [SerializeField] 或 public 且非 [NonSerialized] 的字段
             bool isSerialized = field.IsDefined(typeof(SerializeField), false)
                 || (field.IsPublic && !field.IsDefined(typeof(NonSerializedAttribute), false));
 
             if (!isSerialized)
                 continue;
 
-            // 跳过 init-only 字段（C# 9+ 的 init 访问器）
             if (field.IsInitOnly)
                 continue;
 
@@ -499,7 +449,6 @@ public class CellFracture : MonoBehaviour
             }
             catch
             {
-                // 某些字段（如 native 指针）无法通过反射复制，静默跳过
             }
         }
     }
@@ -533,10 +482,8 @@ public class CellFracture : MonoBehaviour
     #region Static Voronoi Utilities
 
     /// <summary>
-    /// 在局部包围盒内生成细胞种子点。
-    /// </summary>
     public static List<Vector3> GenerateCellPoints(
-        Bounds localBounds, int cellCount, int pointLimit, float noise, System.Random random)
+        Bounds localBounds, int cellCount, float noise, System.Random random)
     {
         List<Vector3> points = new List<Vector3>();
         Vector3 min = localBounds.min;
@@ -583,27 +530,25 @@ public class CellFracture : MonoBehaviour
             points = new List<Vector3>(seen.Values);
         }
 
-        // 限制点数
-        if (pointLimit > 0 && points.Count > pointLimit)
-        {
-            for (int i = points.Count - 1; i > 0; i--)
-            {
-                int j = random.Next(i + 1);
-                var tmp = points[i];
-                points[i] = points[j];
-                points[j] = tmp;
-            }
-            points.RemoveRange(pointLimit, points.Count - pointLimit);
-        }
-
         return points;
     }
 
+    public static List<Vector3> GenerateCellPoints(
+        Bounds localBounds, int cellCount, int pointLimit, float noise, System.Random random)
+    {
+        int limitedCellCount = pointLimit > 0 ? Mathf.Min(cellCount, pointLimit) : cellCount;
+        return GenerateCellPoints(localBounds, limitedCellCount, noise, random);
+    }
+
     /// <summary>
-    /// 计算给定细胞点相对于其他所有点的平分平面列表。
-    /// </summary>
     public static List<CutPlane> GetCellPlanes(
         Vector3 cellPoint, List<Vector3> allPoints, Vector3 cellScale, float gap)
+    {
+        return GetCellPlanes(cellPoint, allPoints, cellScale, gap, 0);
+    }
+
+    public static List<CutPlane> GetCellPlanes(
+        Vector3 cellPoint, List<Vector3> allPoints, Vector3 cellScale, float gap, int maxPlanes)
     {
         var neighbors = new List<(float distSq, Vector3 point)>();
         foreach (var p in allPoints)
@@ -615,9 +560,11 @@ public class CellFracture : MonoBehaviour
         neighbors.Sort((a, b) => a.distSq.CompareTo(b.distSq));
 
         List<CutPlane> planes = new List<CutPlane>();
+        int planeCount = maxPlanes > 0 ? Mathf.Min(maxPlanes, neighbors.Count) : neighbors.Count;
 
-        foreach (var (_, otherPoint) in neighbors)
+        for (int i = 0; i < planeCount; i++)
         {
+            Vector3 otherPoint = neighbors[i].point;
             Vector3 rawNormal = otherPoint - cellPoint;
             float nlength = rawNormal.magnitude;
             if (nlength < 1e-8f)
@@ -643,8 +590,6 @@ public class CellFracture : MonoBehaviour
     }
 
     /// <summary>
-    /// 用一组平面依次切割网格，每次保留细胞点所在的一侧。
-    /// </summary>
     public static Mesh ClipMeshToCell(
         Mesh sourceMesh, List<CutPlane> cellPlanes, Vector3 cellCenter)
     {
@@ -688,7 +633,7 @@ public class CellFracture : MonoBehaviour
             MeshCutter.SliceResult result;
             try
             {
-                result = MeshCutter.Slice(current, plane.point, plane.normal);
+                result = MeshCutter.Slice(current, plane.point, plane.normal, cellOnPositive, !cellOnPositive);
             }
             catch (Exception ex)
             {
@@ -730,8 +675,6 @@ public class CellFracture : MonoBehaviour
     }
 
     /// <summary>
-    /// 使用有符号四面体法计算封闭网格的精确体积。
-    /// </summary>
     public static float CalculateMeshVolume(Mesh mesh)
     {
         if (mesh == null || mesh.triangles == null || mesh.triangles.Length < 3)
@@ -753,8 +696,6 @@ public class CellFracture : MonoBehaviour
     }
 
     /// <summary>
-    /// 生成随机单位向量（均匀分布在球面上）。
-    /// </summary>
     public static Vector3 RandomUnitVector(System.Random random)
     {
         double z = random.NextDouble() * 2.0 - 1.0;
